@@ -208,6 +208,26 @@ struct Saturn {
         return m_systemFeatures.enableBusContention;
     }
 
+    /// @brief Enables or disables SH-2 IF/MA contention approximation.
+    /// @param[in] enable whether to enable or disable IF/MA contention approximation
+    void EnableIFMAContention(bool enable);
+
+    /// @brief Determines if SH-2 IF/MA contention approximation is enabled.
+    /// @return the IF/MA contention approximation state
+    [[nodiscard]] bool IsIFMAContentionEnabled() const noexcept {
+        return m_systemFeatures.enableIFMAContention;
+    }
+
+    /// @brief Enables or disables periodic bus contention stats logging.
+    /// @param[in] enable whether to print aggregate arbiter stats
+    void EnableBusContentionStats(bool enable);
+
+    /// @brief Determines if periodic bus contention stats logging is enabled.
+    /// @return true when bus contention stats logging is enabled
+    [[nodiscard]] bool IsBusContentionStatsEnabled() const noexcept {
+        return m_systemFeatures.enableBusContentionStats;
+    }
+
     /// @brief Enables or disables SCU DMA participation in bus contention arbitration.
     /// @param[in] enable whether SCU DMA should use the arbiter
     void EnableSCUDMAArbitration(bool enable);
@@ -226,6 +246,26 @@ struct Saturn {
     /// @return true when local SCU DMA arbiter tick mode is enabled
     [[nodiscard]] bool IsSCUDMALocalArbiterTickEnabled() const noexcept {
         return m_systemFeatures.enableSCUDMALocalArbiterTick;
+    }
+
+    /// @brief Enables or disables SCSP participation in unified B-bus arbitration.
+    /// @param[in] enable whether SCSP should be included in B-bus arbitration
+    void EnableBBusSCSPArbitration(bool enable);
+
+    /// @brief Determines if SCSP participates in unified B-bus arbitration.
+    /// @return true when SCSP is included in B-bus arbitration
+    [[nodiscard]] bool IsBBusSCSPArbitrationEnabled() const noexcept {
+        return m_systemFeatures.enableBBusSCSPArbitration;
+    }
+
+    /// @brief Enables or disables strict Sattechs SCU-DMA prohibition enforcement.
+    /// @param[in] enable whether strict SCU-DMA restrictions should be enforced
+    void EnableStrictSCUDMARestrictions(bool enable);
+
+    /// @brief Determines if strict Sattechs SCU-DMA prohibition enforcement is enabled.
+    /// @return true when strict SCU-DMA restrictions are enabled
+    [[nodiscard]] bool IsStrictSCUDMARestrictionsEnabled() const noexcept {
+        return m_systemFeatures.enableStrictSCUDMARestrictions;
     }
 
     /// @brief Runs the emulator until the end of the current frame using the current settings.

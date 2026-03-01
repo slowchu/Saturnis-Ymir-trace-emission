@@ -202,8 +202,12 @@ int App::Run(const CommandLineOptions &options) {
 
     m_options = options;
     m_context.saturn.instance->EnableBusContention(m_options.enableBusContention);
+    m_context.saturn.instance->EnableIFMAContention(m_options.enableIFMAContention);
+    m_context.saturn.instance->EnableBusContentionStats(m_options.busContentionStats);
     m_context.saturn.instance->EnableSCUDMAArbitration(!m_options.busContentionSH2Only);
     m_context.saturn.instance->EnableSCUDMALocalArbiterTick(m_options.busContentionSCULocalTick);
+    m_context.saturn.instance->EnableBBusSCSPArbitration(!m_options.busContentionNoSCSP);
+    m_context.saturn.instance->EnableStrictSCUDMARestrictions(!m_options.scuDMALenient);
 
     auto &settings = m_settings;
 

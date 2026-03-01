@@ -13,8 +13,12 @@ struct CommandLineOptions {
     bool startFastForward;
     bool enableDebugTracing;
     bool enableBusContention;
+    bool enableIFMAContention;
+    bool busContentionStats;
     bool busContentionSH2Only;
     bool busContentionSCULocalTick;
+    bool busContentionNoSCSP;
+    bool scuDMALenient;
 };
 
 } // namespace app

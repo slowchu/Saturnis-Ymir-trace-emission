@@ -4,6 +4,7 @@
 
 #include <ymir/util/dev_log.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
 
@@ -173,8 +174,12 @@ Saturn::Saturn()
     m_systemFeatures.enableDebugTracing = false;
     m_systemFeatures.emulateSH2Cache = false;
     m_systemFeatures.enableBusContention = false;
+    m_systemFeatures.enableIFMAContention = false;
+    m_systemFeatures.enableBusContentionStats = false;
     m_systemFeatures.enableSCUDMAArbitration = true;
     m_systemFeatures.enableSCUDMALocalArbiterTick = false;
+    m_systemFeatures.enableBBusSCSPArbitration = true;
+    m_systemFeatures.enableStrictSCUDMARestrictions = true;
     RefreshBusArbiter();
     UpdateFunctionPointers();
 
@@ -289,6 +294,8 @@ void Saturn::LoadDisc(media::Disc &&disc) {
     ConfigureAccessCycles(hasFlag(db::GameInfo::Flags::FastBusTimings));
     ForceSH2CacheEmulation(hasFlag(db::GameInfo::Flags::ForceSH2Cache));
     SCSP.SetCPUClockShift(hasFlag(db::GameInfo::Flags::FastMC68EC000) ? 1 : 0);
+    // Keep VDP1 VRAM-write stall as a game-specific workaround.
+    // Enabling it globally under bus contention can over-stall FMV/BIOS paths.
     VDP.SetStallVDP1OnVRAMWrites(hasFlag(db::GameInfo::Flags::StallVDP1OnVRAMWrites));
 }
 
@@ -404,11 +411,19 @@ void Saturn::EnableDebugTracing(bool enable) {
 }
 
 void Saturn::EnableBusContention(bool enable) {
+    if (enable && !m_systemFeatures.emulateSH2Cache) {
+        devlog::warn<grp::system>("Bus contention requires SH-2 cache emulation; forcing cache emulation on");
+        configuration.system.emulateSH2Cache = true;
+    }
     if (m_systemFeatures.enableBusContention == enable) {
         return;
     }
     m_systemFeatures.enableBusContention = enable;
     RefreshBusArbiter();
+}
+
+void Saturn::EnableIFMAContention(bool enable) {
+    m_systemFeatures.enableIFMAContention = enable;
 }
 
 void Saturn::EnableSCUDMAArbitration(bool enable) {
@@ -419,11 +434,35 @@ void Saturn::EnableSCUDMAArbitration(bool enable) {
     RefreshBusArbiter();
 }
 
+void Saturn::EnableBusContentionStats(bool enable) {
+    if (m_systemFeatures.enableBusContentionStats == enable) {
+        return;
+    }
+    m_systemFeatures.enableBusContentionStats = enable;
+    RefreshBusArbiter();
+}
+
 void Saturn::EnableSCUDMALocalArbiterTick(bool enable) {
     if (m_systemFeatures.enableSCUDMALocalArbiterTick == enable) {
         return;
     }
     m_systemFeatures.enableSCUDMALocalArbiterTick = enable;
+    RefreshBusArbiter();
+}
+
+void Saturn::EnableBBusSCSPArbitration(bool enable) {
+    if (m_systemFeatures.enableBBusSCSPArbitration == enable) {
+        return;
+    }
+    m_systemFeatures.enableBBusSCSPArbitration = enable;
+    RefreshBusArbiter();
+}
+
+void Saturn::EnableStrictSCUDMARestrictions(bool enable) {
+    if (m_systemFeatures.enableStrictSCUDMARestrictions == enable) {
+        return;
+    }
+    m_systemFeatures.enableStrictSCUDMARestrictions = enable;
     RefreshBusArbiter();
 }
 
@@ -444,10 +483,45 @@ uint32 Saturn::BusArbiterAccessCycles(void *ctx, uint32 addr, bool isWrite, uint
     if (sizeBytes == 16) {
         return baseCycles * 4;
     }
+
+    // Unified B-Bus arbitration domain with per-device service policy:
+    // - SCSP accesses on SH-2 side are frequently longword requests crossing a 16-bit interface.
+    //   Charge longword writes as two half-word beats to avoid treating them as a single beat.
+    // - VDP1/VDP2 keep current service model for now.
+    if (addr >= 0x5A0'0000 && addr <= 0x5FB'FFFF) {
+        enum class BBusDevice : uint8 { SCSP, VDP1, VDP2 };
+        BBusDevice device = BBusDevice::VDP2;
+        if (addr <= 0x5BF'FFFF) {
+            device = BBusDevice::SCSP;
+        } else if (addr <= 0x5D7'FFFF) {
+            device = BBusDevice::VDP1;
+        }
+
+        if (device == BBusDevice::SCSP && !saturn->m_systemFeatures.enableBBusSCSPArbitration) {
+            return baseCycles;
+        }
+
+        if (device == BBusDevice::SCSP && isWrite && sizeBytes >= sizeof(uint32)) {
+            const uint64 splitCycles = static_cast<uint64>(baseCycles) * 2;
+            return static_cast<uint32>(std::min<uint64>(splitCycles, 0xFFFFFFFFULL));
+        }
+        return baseCycles;
+    }
+
+    // NOTE:
+    // `sizeBytes == 4` width scaling is intentionally disabled for now.
+    // SH2::AccessCycles is still width-agnostic for many MA/IF paths and currently
+    // reports 4-byte accesses by default, which would globally overcharge service.
+    // Keep only explicit cache-line-fill scaling (sizeBytes == 16) until full
+    // width plumbing is completed end-to-end (Phase 7).
+
     return baseCycles;
 }
 
 void Saturn::RefreshBusArbiter() {
+    m_busArbiterConfig.enable_stats = m_systemFeatures.enableBusContentionStats;
+    m_busArbiterConfig.stats_report_interval = 1'000'000;
+
     if (m_systemFeatures.enableBusContention) {
         m_busArbiter = std::make_unique<busarb::Arbiter>(
             busarb::TimingCallbacks{.access_cycles = &Saturn::BusArbiterAccessCycles, .ctx = this}, m_busArbiterConfig);
@@ -461,6 +535,8 @@ void Saturn::RefreshBusArbiter() {
     SCU.EnableBusContention(m_systemFeatures.enableBusContention);
     SCU.EnableBusContentionForDMA(m_systemFeatures.enableSCUDMAArbitration);
     SCU.EnableBusContentionLocalTick(m_systemFeatures.enableSCUDMALocalArbiterTick);
+    SCU.EnableBBusSCSPArbitration(m_systemFeatures.enableBBusSCSPArbitration);
+    SCU.EnableStrictDMARestrictions(m_systemFeatures.enableStrictSCUDMARestrictions);
 }
 
 void Saturn::SaveState(state::State &state) const {
@@ -564,6 +640,12 @@ bool Saturn::LoadState(const state::State &state, bool skipROMChecks) {
         CDBlock.LoadState(state.cdblock);
     }
 
+    // Arbiter domain timelines are runtime-only state and are not serialized.
+    // After loading a savestate, scheduler time may jump backwards relative to
+    // pre-load execution. Recreate arbiter state to avoid stale bus_free_tick
+    // values causing pathological multi-million-cycle waits after reload.
+    RefreshBusArbiter();
+
     return true;
 }
 
@@ -613,7 +695,9 @@ bool Saturn::Run() {
     const uint64 cycles = static_config::max_timing_granularity ? 1 : std::max<sint64>(m_scheduler.RemainingCount(), 0);
 
     uint64 execCycles;
-    if (SCU.IsDMAActive()) {
+    const bool useInterleavedSCUDMA =
+        m_systemFeatures.enableBusContention && m_systemFeatures.enableSCUDMAArbitration;
+    if (SCU.IsDMAActive() && !useInterleavedSCUDMA) {
         // Stall both SH2 CPUs and only run the SCU and other stuff
         execCycles = cycles;
         SCU.Advance<debug>(execCycles);
@@ -846,6 +930,10 @@ void Saturn::UpdatePreferredRegionOrder(std::span<const core::config::sys::Regio
 
 void Saturn::UpdateSH2CacheEmulation(bool enabled) {
     enabled |= m_forceSH2CacheEmulation;
+    if (m_systemFeatures.enableBusContention && !enabled) {
+        devlog::warn<grp::system>("SH-2 cache emulation cannot be disabled while bus contention is enabled");
+        enabled = true;
+    }
     if (!m_systemFeatures.emulateSH2Cache && enabled) {
         masterSH2.PurgeCache();
         slaveSH2.PurgeCache();

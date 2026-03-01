@@ -12,7 +12,9 @@
 #include <ymir/util/scope_guard.hpp>
 #include <ymir/util/size_ops.hpp>
 
+#include <algorithm>
 #include <bit>
+#include <cstdio>
 
 namespace ymir::scu {
 
@@ -71,6 +73,8 @@ void SCU::Reset(bool hard) {
             ch.Reset();
         }
         m_activeDMAChannelLevel = m_dmaChannels.size();
+        m_dmaArbiterNowTick = 0;
+        m_lastImmediateDMARunTick = ~static_cast<uint64>(0);
     }
 
     m_dsp.Reset(hard);
@@ -518,6 +522,8 @@ void SCU::LoadState(const state::SCUState &state) {
     m_WRAMSizeSelect = state.wramSizeSelect;
 
     RecalcDMAChannel();
+    m_dmaArbiterNowTick = m_scheduler.CurrentCount();
+    m_lastImmediateDMARunTick = m_scheduler.CurrentCount();
 }
 
 void SCU::OnTimer1Event(core::EventContext &eventContext, void *userContext) {
@@ -642,43 +648,6 @@ FORCE_INLINE static uint32 AdjustZeroSizeXferCount(uint32 level, uint32 xferCoun
     }
 }
 
-void SCU::DMAReadIndirectTransfer(uint8 level) {
-    auto &ch = m_dmaChannels[level];
-    const uint32 baseIndirectSrc = ch.currIndirectSrc;
-    uint32 currIndirectSrc = baseIndirectSrc;
-    auto read = [&] {
-        const uint32 value = m_bus.Read<uint32>(currIndirectSrc);
-        currIndirectSrc += ch.srcAddrInc;
-        return value;
-    };
-
-    ch.currXferCount = ((read() - 1u) & 0xFFFFF) + 1u;
-    ch.currDstAddr = read();
-    ch.currSrcAddr = read();
-    ch.currIndirectSrc = currIndirectSrc;
-    ch.endIndirect = bit::test<31>(ch.currSrcAddr);
-    ch.currSrcAddr &= 0x7FF'FFFF;
-    ch.currDstAddr &= 0x7FF'FFFF;
-    ch.currSrcAddrInc = ch.srcAddrInc;
-    ch.currDstAddrInc = ch.dstAddrInc;
-    ch.InitTransfer();
-
-    devlog::trace<grp::dma_start>(
-        "SCU DMA{}: Starting indirect transfer at {:08X} - {:06X} bytes from {:08X} (+{:02X}) to {:08X} (+{:02X}){}",
-        level, baseIndirectSrc, ch.currXferCount, ch.currSrcAddr, ch.currSrcAddrInc, ch.currDstAddr, ch.currDstAddrInc,
-        (ch.endIndirect ? " (final)" : ""));
-
-    if (ch.currSrcAddr & 1) {
-        devlog::debug<grp::dma>("SCU DMA{}: Unaligned indirect transfer read from {:08X}", level, ch.currSrcAddr);
-    }
-    if (ch.currDstAddr & 1) {
-        devlog::debug<grp::dma>("SCU DMA{}: Unaligned indirect transfer write to {:08X}", level, ch.currDstAddr);
-    }
-
-    TraceDMA(m_tracer, level, ch.currSrcAddr, ch.currDstAddr, ch.currXferCount, ch.currSrcAddrInc, ch.currDstAddrInc,
-             true, baseIndirectSrc);
-}
-
 void SCU::RunDMA(uint64 cycles) {
     for (uint32 level = 0; level < m_dmaChannels.size(); ++level) {
         auto &ch = m_dmaChannels[level];
@@ -693,21 +662,86 @@ void SCU::RunDMA(uint64 cycles) {
         }
     }
 
-    // TODO: proper cycle counting
+    // With contention enabled, bound DMA work by elapsed emulated cycles in this scheduling slice.
+    // `RunDMA(0)` is used for immediate-trigger kickoffs; give it one scheduler quantum so transfers
+    // can make meaningful progress without running unbounded.
+    const uint64 schedulerTick = m_scheduler.CurrentCount();
+    uint64 localTick = schedulerTick;
+    const bool usePersistentLocalTick =
+        m_enableBusContention && m_enableBusContentionLocalTick && m_enableBusContentionForDMA;
+    if (usePersistentLocalTick) {
+        localTick = std::max(localTick, m_dmaArbiterNowTick);
+    }
+    // Keep immediate DMA kickoff bounded and conservative. Larger quanta can
+    // overbook startup DMA and create large contention spikes.
+    static constexpr uint64 kImmediateDmaQuantumCycles = 32;
+    // Hard cap per RunDMA() call under contention. This preserves bounded
+    // scheduling even when the caller hands us a large elapsed-cycle chunk.
+    static constexpr uint64 kMaxDMACycleBudgetPerCall = 512;
+    const uint64 requestedCycleBudget = cycles > 0 ? cycles : kImmediateDmaQuantumCycles;
+    const uint64 cycleBudget = m_enableBusContention
+                                   ? std::min<uint64>(requestedCycleBudget, kMaxDMACycleBudgetPerCall)
+                                   : 0u;
+    const uint64 budgetStartTick = localTick;
+    uint32 transferUnitsThisCall = 0;
 
-    uint64 dmaArbiterNowTick = m_scheduler.CurrentCount();
+    util::ScopeGuard sgRunDMASummary{[&] {
+        if (!m_enableBusContention || m_busArbiter == nullptr) {
+            return;
+        }
+        static constexpr uint64 kRunDMADriftLogThresholdCycles = 20000;
+        const uint64 drift = localTick > schedulerTick ? (localTick - schedulerTick) : 0u;
+        if (drift < kRunDMADriftLogThresholdCycles) {
+            return;
+        }
+        std::fprintf(stderr,
+                     "[busarb] scuctx path=DMA-RUN scheduler=%llu local=%llu drift=%llu "
+                     "budget=%llu arg_cycles=%llu units=%u active_level=%u\n",
+                     static_cast<unsigned long long>(schedulerTick), static_cast<unsigned long long>(localTick),
+                     static_cast<unsigned long long>(drift), static_cast<unsigned long long>(cycleBudget),
+                     static_cast<unsigned long long>(cycles), static_cast<unsigned int>(transferUnitsThisCall),
+                     static_cast<unsigned int>(m_activeDMAChannelLevel));
+    }};
 
-    // HACK: complete all active transfers
+    util::ScopeGuard sgPersistLocalTick{[&] {
+        if (!usePersistentLocalTick) {
+            return;
+        }
+        const uint64 nowTick = m_scheduler.CurrentCount();
+        if (m_activeDMAChannelLevel < m_dmaChannels.size()) {
+            m_dmaArbiterNowTick = localTick;
+        } else {
+            // No active DMA: keep local tick aligned to scheduler time.
+            m_dmaArbiterNowTick = nowTick;
+        }
+    }};
+
     while (m_activeDMAChannelLevel < m_dmaChannels.size()) {
+        // Re-evaluate channel priority at transfer-unit boundaries so higher-priority levels
+        // can preempt lower-priority active transfers between units.
+        RecalcDMAChannel();
+        if (m_activeDMAChannelLevel >= m_dmaChannels.size()) {
+            break;
+        }
+
+        if (m_enableBusContention && cycleBudget > 0 && localTick > budgetStartTick &&
+            (localTick - budgetStartTick) >= cycleBudget) {
+            return;
+        }
+
         const uint8 level = m_activeDMAChannelLevel;
 
         auto &ch = m_dmaChannels[level];
         assert(ch.active);
+        ++transferUnitsThisCall;
 
-        auto &xfer = ch.xfer;
+        struct StallCheckResult {
+            uint64 consumedCycles = 0;
+            bool shouldYield = false;
+        };
 
-        auto checkStall = [&](uint32 address, uint32 size, bool write) {
-            auto isArbiterManagedAddress = [](uint32 busAddress) {
+        auto checkStall = [&](uint32 address, uint32 size, bool write, const char *phase) -> StallCheckResult {
+            auto isArbiterManagedAddress = [this](uint32 busAddress) {
                 if (busAddress <= 0x00F'FFFF) {
                     return true;
                 }
@@ -717,11 +751,20 @@ void SCU::RunDMA(uint64 cycles) {
                 if (busAddress >= 0x200'0000 && busAddress <= 0x4FF'FFFF) {
                     return true;
                 }
+                if (busAddress >= 0x5A0'0000 && busAddress <= 0x5FB'FFFF) {
+                    if (!m_enableBBusSCSPArbitration && busAddress <= 0x5BF'FFFF) {
+                        return false;
+                    }
+                    return true;
+                }
                 if (busAddress >= 0x600'0000 && busAddress <= 0x7FF'FFFF) {
                     return true;
                 }
                 return false;
             };
+
+            static constexpr uint32 kContextWaitLogThresholdCycles = 20000;
+            StallCheckResult result{};
 
             if (m_enableBusContention && m_enableBusContentionForDMA && m_busArbiter != nullptr &&
                 isArbiterManagedAddress(address)) {
@@ -730,35 +773,132 @@ void SCU::RunDMA(uint64 cycles) {
                 req.addr = address;
                 req.is_write = write;
                 req.size_bytes = static_cast<uint8>(size > 0xFFu ? 0xFFu : size);
-                req.now_tick = m_enableBusContentionLocalTick ? dmaArbiterNowTick : m_scheduler.CurrentCount();
+                req.now_tick = localTick;
+                static constexpr uint64 kArbiterRebaseThresholdCycles = 50'000ULL;
+                m_busArbiter->rebase_if_far_ahead(req.addr, req.now_tick, kArbiterRebaseThresholdCycles);
 
                 const busarb::BusWaitResult wait = m_busArbiter->query_wait(req);
+                if (wait.should_wait && wait.wait_cycles >= kContextWaitLogThresholdCycles) {
+                    std::fprintf(stderr,
+                                  "[busarb] scuctx path=DMA level=%u phase=%s bus=%08X size=%u write=%u now=%llu "
+                                  "wait=%u src=%08X dst=%08X rem=%06X\n",
+                                  static_cast<unsigned int>(level), phase,
+                                  static_cast<unsigned int>(address), static_cast<unsigned int>(size), write ? 1U : 0U,
+                                  static_cast<unsigned long long>(req.now_tick), wait.wait_cycles,
+                                  static_cast<unsigned int>(ch.currSrcAddr), static_cast<unsigned int>(ch.currDstAddr),
+                                  static_cast<unsigned int>(ch.currXferCount));
+                }
                 if (wait.should_wait) {
-                    devlog::trace<grp::dma>("SCU DMA{}: {}-bit {} {:08X} stalled by arbiter", level, size * 8,
-                                            (write ? "write to" : "read from"), address);
-                    return true;
+                    devlog::trace<grp::dma>(
+                        "SCU DMA{}: {}-bit {} {:08X} delayed by arbiter ({} cycles)", level, size * 8,
+                        (write ? "write to" : "read from"), address, static_cast<unsigned long long>(wait.wait_cycles));
                 }
 
                 const uint64 tickStart = req.now_tick + wait.wait_cycles;
                 m_busArbiter->commit_grant(req, tickStart);
-                if (m_enableBusContentionLocalTick) {
-                    dmaArbiterNowTick = m_busArbiter->bus_free_tick(req.addr);
-                }
-                return false;
+                result.consumedCycles = m_busArbiter->bus_free_tick(req.addr) - req.now_tick;
+                return result;
             }
 
             if (m_bus.IsBusWait(address, size, write)) {
                 devlog::trace<grp::dma>("SCU DMA{}: {}-bit {} {:08X} stalled by bus wait signal", level, size * 8,
                                         (write ? "write to" : "read from"), ch.currSrcAddr);
-                return true;
+                result.shouldYield = true;
+                return result;
             }
-            return false;
+            if (m_enableBusContention) {
+                result.consumedCycles =
+                    write ? m_bus.GetAccessCycles<true>(address) : m_bus.GetAccessCycles<false>(address);
+            }
+            return result;
         };
 
-        auto checkReadStall = [&](uint32 size) {
-            return xfer.bufPos + size > 4 && checkStall(ch.currSrcAddr & ~3u, sizeof(uint32), false);
+        auto applyStallResult = [&](const StallCheckResult &result) {
+            localTick += result.consumedCycles;
+            return result.shouldYield;
         };
-        auto checkWriteStall = [&](uint32 address, uint32 size) { return checkStall(address, size, true); };
+
+        auto readIndirectDescriptor = [&]() {
+            const uint32 baseIndirectSrc = ch.currIndirectSrc;
+            uint32 currIndirectSrc = baseIndirectSrc;
+            auto readDescriptorWord = [&](const char *phase, uint32 &outValue) {
+                const auto stallResult = checkStall(currIndirectSrc, sizeof(uint32), false, phase);
+                if (applyStallResult(stallResult)) {
+                    return false;
+                }
+                outValue = m_bus.Read<uint32>(currIndirectSrc);
+                currIndirectSrc += ch.srcAddrInc;
+                return true;
+            };
+
+            uint32 rawXferCount = 0;
+            uint32 rawDstAddr = 0;
+            uint32 rawSrcAddr = 0;
+            if (!readDescriptorWord("indirect-count", rawXferCount) ||
+                !readDescriptorWord("indirect-dst", rawDstAddr) || !readDescriptorWord("indirect-src", rawSrcAddr)) {
+                return false;
+            }
+
+            ch.currXferCount = ((rawXferCount - 1u) & 0xFFFFF) + 1u;
+            ch.currDstAddr = rawDstAddr;
+            ch.currSrcAddr = rawSrcAddr;
+            ch.currIndirectSrc = currIndirectSrc;
+            ch.endIndirect = bit::test<31>(ch.currSrcAddr);
+            ch.currSrcAddr &= 0x7FF'FFFF;
+            ch.currDstAddr &= 0x7FF'FFFF;
+            ch.currSrcAddrInc = ch.srcAddrInc;
+            ch.currDstAddrInc = ch.dstAddrInc;
+            ch.InitTransfer();
+
+            devlog::trace<grp::dma_start>(
+                "SCU DMA{}: Starting indirect transfer at {:08X} - {:06X} bytes from {:08X} (+{:02X}) to {:08X} "
+                "(+{:02X}){}",
+                level, baseIndirectSrc, ch.currXferCount, ch.currSrcAddr, ch.currSrcAddrInc, ch.currDstAddr,
+                ch.currDstAddrInc, (ch.endIndirect ? " (final)" : ""));
+
+            if (ch.currSrcAddr & 1) {
+                devlog::debug<grp::dma>("SCU DMA{}: Unaligned indirect transfer read from {:08X}", level,
+                                        ch.currSrcAddr);
+            }
+            if (ch.currDstAddr & 1) {
+                devlog::debug<grp::dma>("SCU DMA{}: Unaligned indirect transfer write to {:08X}", level,
+                                        ch.currDstAddr);
+            }
+
+            TraceDMA(m_tracer, level, ch.currSrcAddr, ch.currDstAddr, ch.currXferCount, ch.currSrcAddrInc,
+                     ch.currDstAddrInc, true, baseIndirectSrc);
+            return true;
+        };
+
+        if (ch.indirect && ch.currXferCount == 0) {
+            if (!readIndirectDescriptor()) {
+                return;
+            }
+        }
+
+        auto &xfer = ch.xfer;
+
+        auto checkReadStall = [&](uint32 size) -> StallCheckResult {
+            if (xfer.bufPos + size > 4) {
+                return checkStall(ch.currSrcAddr & ~3u, sizeof(uint32), false, "read");
+            }
+            return {};
+        };
+        auto checkWriteStall = [&](uint32 address, uint32 size) -> StallCheckResult {
+            return checkStall(address, size, true, "write");
+        };
+        auto checkReadWriteStall = [&](uint32 readSize, uint32 writeAddress, uint32 writeSize) {
+            const auto readResult = checkReadStall(readSize);
+            if (readResult.shouldYield) {
+                return true;
+            }
+            const auto writeResult = checkWriteStall(writeAddress, writeSize);
+            if (writeResult.shouldYield) {
+                return true;
+            }
+            localTick += std::max(readResult.consumedCycles, writeResult.consumedCycles);
+            return false;
+        };
 
 #if defined(YMIR_BUS_TRACE) && (YMIR_BUS_TRACE + 0)
         auto emitDMAWriteTrace = [&](uint32 address, uint32 size) {
@@ -782,7 +922,7 @@ void SCU::RunDMA(uint64 cycles) {
 #endif
 
         if (xfer.started) {
-            if (checkReadStall(sizeof(uint32))) {
+            if (applyStallResult(checkReadStall(sizeof(uint32)))) {
                 return;
             }
             xfer.started = false;
@@ -817,6 +957,19 @@ void SCU::RunDMA(uint64 cycles) {
 
         const BusID srcBus = GetBusID(ch.currSrcAddr);
         const BusID dstBus = GetBusID(ch.currDstAddr);
+        auto abortIllegalTransfer = [&] {
+            if (ch.indirect && !ch.endIndirect) {
+                ch.currXferCount = 0;
+                if (!readIndirectDescriptor()) {
+                    return false;
+                }
+            } else {
+                ch.active = false;
+                TriggerDMAIllegal();
+                RecalcDMAChannel();
+            }
+            return true;
+        };
 
         // Are you ready for the shitshow that is DMA transfers on the SCU? Let's begin!
 
@@ -829,14 +982,31 @@ void SCU::RunDMA(uint64 cycles) {
             } else if (dstBus == BusID::None) {
                 devlog::trace<grp::dma>("SCU DMA{}: Invalid destination bus; transfer ignored", level);
             }
-            if (ch.indirect && !ch.endIndirect) {
-                DMAReadIndirectTransfer(level);
-            } else {
-                ch.active = false;
-                TriggerDMAIllegal();
-                RecalcDMAChannel();
+            if (!abortIllegalTransfer()) {
+                return;
             }
             continue;
+        }
+
+        if (m_enableStrictDMARestrictions) {
+            const uint32 srcAddr = ch.currSrcAddr & 0x7FF'FFFF;
+            const uint32 dstAddr = ch.currDstAddr & 0x7FF'FFFF;
+
+            // Sattechs: SCU-DMA cannot write to A-Bus and cannot read from VDP2 area.
+            if (util::AddressInRange<0x200'0000, 0x58F'FFFF>(dstAddr) ||
+                util::AddressInRange<0x5E0'0000, 0x5FB'FFFF>(srcAddr)) {
+                std::fprintf(stderr,
+                             "[scu] dma_illegal level=%u reason=%s src=%08X dst=%08X rem=%06X indirect=%u\n",
+                             static_cast<unsigned int>(level),
+                             util::AddressInRange<0x200'0000, 0x58F'FFFF>(dstAddr) ? "a-bus-write-prohibited"
+                                                                                   : "vdp2-read-prohibited",
+                             static_cast<unsigned int>(srcAddr), static_cast<unsigned int>(dstAddr),
+                             static_cast<unsigned int>(ch.currXferCount), ch.indirect ? 1U : 0U);
+                if (!abortIllegalTransfer()) {
+                    return;
+                }
+                continue;
+            }
         }
 
         uint32 currDstOffset = xfer.currDstOffset;
@@ -866,7 +1036,7 @@ void SCU::RunDMA(uint64 cycles) {
             // 8-bit -> 16/32-bit realignment
             if (ch.currXferCount >= 1 && (currDstOffset & 1)) {
                 const uint32 addr = currDstAddr + currDstOffset;
-                if (checkReadStall(sizeof(uint8)) || checkWriteStall(addr, sizeof(uint8))) {
+                if (checkReadWriteStall(sizeof(uint8), addr, sizeof(uint8))) {
                     return;
                 }
                 const uint8 value = read8();
@@ -880,13 +1050,20 @@ void SCU::RunDMA(uint64 cycles) {
 
                 devlog::trace<grp::dma>("SCU DMA{}: 8-bit write to {:08X} -> {:02X}, {:X} bytes remaining", level, addr,
                                         value, ch.currXferCount);
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // 16-bit -> 32-bit realignment
             if (ch.currXferCount >= 2 && (currDstOffset & 2)) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 const uint32 addr = (currDstAddr + currDstOffset) & ~1u;
-                if (checkReadStall(sizeof(uint16)) || checkWriteStall(addr, sizeof(uint16))) {
+                if (checkReadWriteStall(sizeof(uint16), addr, sizeof(uint16))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
                 const uint16 value = read16();
@@ -900,13 +1077,20 @@ void SCU::RunDMA(uint64 cycles) {
 
                 devlog::trace<grp::dma>("SCU DMA{}: 16-bit write to {:08X} -> {:04X}, {:X} bytes remaining", level,
                                         addr, value, ch.currXferCount);
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // 32-bit transfers -- the bulk of the DMA operation
-            while (ch.currXferCount >= 4) {
+            if (ch.currXferCount >= 4) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 const uint32 addr = (currDstAddr + currDstOffset) & ~3u;
-                if (checkReadStall(sizeof(uint32)) || checkWriteStall(addr, sizeof(uint32))) {
+                if (checkReadWriteStall(sizeof(uint32), addr, sizeof(uint32))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
                 const uint32 value = read32();
@@ -920,13 +1104,20 @@ void SCU::RunDMA(uint64 cycles) {
 
                 devlog::trace<grp::dma>("SCU DMA{}: 32-bit write to {:08X} -> {:08X}, {:X} bytes remaining", level,
                                         addr, value, ch.currXferCount);
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // Final 16-bit transfer
             if (ch.currXferCount & 2) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 const uint32 addr = (currDstAddr + currDstOffset) & ~1u;
-                if (checkReadStall(sizeof(uint16)) || checkWriteStall(addr, sizeof(uint16))) {
+                if (checkReadWriteStall(sizeof(uint16), addr, sizeof(uint16))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
                 const uint16 value = read16();
@@ -940,13 +1131,20 @@ void SCU::RunDMA(uint64 cycles) {
 
                 devlog::trace<grp::dma>("SCU DMA{}: 16-bit write to {:08X} -> {:04X}, {:X} bytes remaining", level,
                                         addr, value, ch.currXferCount);
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // Final 8-bit transfer
             if (ch.currXferCount & 1) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 const uint32 addr = currDstAddr + currDstOffset;
-                if (checkReadStall(sizeof(uint8)) || checkWriteStall(addr, sizeof(uint8))) {
+                if (checkReadWriteStall(sizeof(uint8), addr, sizeof(uint8))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
                 const uint8 value = read8();
@@ -960,6 +1158,9 @@ void SCU::RunDMA(uint64 cycles) {
 
                 devlog::trace<grp::dma>("SCU DMA{}: 8-bit write to {:08X} -> {:02X}, {:X} bytes remaining", level, addr,
                                         value, ch.currXferCount);
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // Now that we've dealt with this perfectly logical implementation, let's take a look at the nonsensical
@@ -975,7 +1176,7 @@ void SCU::RunDMA(uint64 cycles) {
             // 8-bit -> 16/32-bit realignment
             if (ch.currXferCount >= 1 && (currDstOffset & 1)) {
                 const uint32 addr = currDstAddr | currDstOffset;
-                if (checkReadStall(sizeof(uint8)) || checkWriteStall(addr, sizeof(uint8))) {
+                if (checkReadWriteStall(sizeof(uint8), addr, sizeof(uint8))) {
                     return;
                 }
                 const uint8 value = read8();
@@ -996,10 +1197,15 @@ void SCU::RunDMA(uint64 cycles) {
                     currDstAddr += ch.currDstAddrInc;
                     currDstAddr &= 0x7FF'FFFF;
                 }
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // 16-bit -> 32-bit realignment
             if (ch.currXferCount >= 2 && (currDstOffset & 2)) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 uint32 addr = (currDstAddr | currDstOffset) & ~1u;
 
@@ -1009,7 +1215,9 @@ void SCU::RunDMA(uint64 cycles) {
                     addr += ch.currDstAddrInc;
                 }
 
-                if (checkReadStall(sizeof(uint16)) || checkWriteStall(addr, sizeof(uint16))) {
+                if (checkReadWriteStall(sizeof(uint16), addr, sizeof(uint16))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
 
@@ -1031,20 +1239,43 @@ void SCU::RunDMA(uint64 cycles) {
                     currDstAddr += ch.currDstAddrInc;
                     currDstAddr &= 0x7FF'FFFF;
                 }
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // 32-bit -> 2x 16-bit transfer -- the bulk of the DMA operation
             // B-Bus is 16-bit but the SCU seems to attempt to handle this as a 32-bit write anyway
-            while (ch.currXferCount >= 4) {
+            if (ch.currXferCount >= 4) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
 
                 const uint32 addr1 = (currDstAddr | currDstOffset) & ~1u;
                 const uint32 addr2 = (((currDstAddr + ch.currDstAddrInc) & 0x7FF'FFFF) | currDstOffset) & ~1u;
 
-                if (checkReadStall(sizeof(uint32)) || checkWriteStall(addr1, sizeof(uint16)) ||
-                    checkWriteStall(addr2, sizeof(uint16))) {
+                const auto readResult = checkReadStall(sizeof(uint32));
+                if (readResult.shouldYield) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
+                const auto write1Result = checkWriteStall(addr1, sizeof(uint16));
+                if (write1Result.shouldYield) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
+                    return;
+                }
+                const auto write2Result = checkWriteStall(addr2, sizeof(uint16));
+                if (write2Result.shouldYield) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
+                    return;
+                }
+                // Two destination half-writes are serialized on B-Bus, while source-side read can overlap.
+                // `write2Result.consumedCycles` already includes the first half-write because both stall checks
+                // are measured from the same localTick baseline.
+                localTick += std::max(readResult.consumedCycles, write2Result.consumedCycles);
 
                 const uint32 value1 = read16();
                 m_bus.Write<uint16>(addr1, value1);
@@ -1073,14 +1304,20 @@ void SCU::RunDMA(uint64 cycles) {
                     // chain multiple transfers in a row and reuse the previous write address... oh, wait.
                     currDstAddr -= ch.currDstAddrInc;
                     currDstAddr &= 0x7FF'FFFF;
+                } else {
+                    continue;
                 }
             }
 
             // Final 16-bit transfer
             if (ch.currXferCount & 2) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 const uint32 addr = (currDstAddr | currDstOffset) & ~1u;
-                if (checkReadStall(sizeof(uint16)) || checkWriteStall(addr, sizeof(uint16))) {
+                if (checkReadWriteStall(sizeof(uint16), addr, sizeof(uint16))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
                 const uint16 value = read16();
@@ -1096,10 +1333,15 @@ void SCU::RunDMA(uint64 cycles) {
                                         addr, value, ch.currXferCount);
 
                 // This is the only well-behaved case; no shenanigans here
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
 
             // Final 8-bit transfer
             if (ch.currXferCount & 1) {
+                const uint32 prevDstAddr = currDstAddr;
+                const uint32 prevDstOffset = currDstOffset;
                 incDst();
                 uint32 addr = currDstAddr | currDstOffset;
 
@@ -1109,7 +1351,9 @@ void SCU::RunDMA(uint64 cycles) {
                     addr += ch.currDstAddrInc;
                 }
 
-                if (checkReadStall(sizeof(uint8)) || checkWriteStall(addr, sizeof(uint8))) {
+                if (checkReadWriteStall(sizeof(uint8), addr, sizeof(uint8))) {
+                    currDstAddr = prevDstAddr;
+                    currDstOffset = prevDstOffset;
                     return;
                 }
 
@@ -1124,6 +1368,9 @@ void SCU::RunDMA(uint64 cycles) {
 
                 devlog::trace<grp::dma>("SCU DMA{}: 8-bit write to {:08X} -> {:02X}, {:X} bytes remaining", level, addr,
                                         value, ch.currXferCount);
+                if (ch.currXferCount > 0) {
+                    continue;
+                }
             }
         }
 
@@ -1133,7 +1380,10 @@ void SCU::RunDMA(uint64 cycles) {
         assert(ch.currXferCount == 0);
 
         if (ch.indirect && !ch.endIndirect) {
-            DMAReadIndirectTransfer(level);
+            ch.currXferCount = 0;
+            if (!readIndirectDescriptor()) {
+                return;
+            }
             sgUpdateDst.Cancel();
         } else {
             devlog::trace<grp::dma>("SCU DMA{}: Finished transfer", level);
@@ -1173,9 +1423,11 @@ void SCU::RunDMA(uint64 cycles) {
 }
 
 void SCU::RecalcDMAChannel() {
+    const uint8 previousLevel = m_activeDMAChannelLevel;
     m_activeDMAChannelLevel = m_dmaChannels.size();
 
-    for (int level = 2; level >= 0; level--) {
+    // SCU DMA priority order per SCU User's Manual (3.2): level 2 (highest) -> level 0 (lowest).
+    for (int level = 2; level >= 0; --level) {
         auto &ch = m_dmaChannels[level];
 
         if (!ch.enabled) {
@@ -1193,23 +1445,13 @@ void SCU::RecalcDMAChannel() {
         ch.active = true;
         if (ch.indirect) {
             ch.currIndirectSrc = ch.dstAddr;
-            DMAReadIndirectTransfer(level);
-
-            const BusID srcBus = GetBusID(ch.currSrcAddr);
-            const BusID dstBus = GetBusID(ch.currDstAddr);
-            if (srcBus == dstBus || srcBus == BusID::None || dstBus == BusID::None) [[unlikely]] {
-                if (srcBus == dstBus) {
-                    devlog::trace<grp::dma>("SCU DMA{}: Invalid same-bus transfer; ignored", level);
-                } else if (srcBus == BusID::None) {
-                    devlog::trace<grp::dma>("SCU DMA{}: Invalid source bus; transfer ignored", level);
-                } else if (dstBus == BusID::None) {
-                    devlog::trace<grp::dma>("SCU DMA{}: Invalid destination bus; transfer ignored", level);
-                }
-                ch.active = false;
-                TriggerDMAIllegal();
-                RecalcDMAChannel();
-                continue;
-            }
+            ch.currXferCount = 0;
+            ch.endIndirect = false;
+            ch.currSrcAddr = 0;
+            ch.currDstAddr = 0;
+            ch.currSrcAddrInc = ch.srcAddrInc;
+            ch.currDstAddrInc = ch.dstAddrInc;
+            ch.InitTransfer();
         } else {
             ch.currSrcAddr = ch.srcAddr & 0x7FF'FFFF;
             ch.currDstAddr = ch.dstAddr & 0x7FF'FFFF;
@@ -1233,6 +1475,21 @@ void SCU::RecalcDMAChannel() {
         m_activeDMAChannelLevel = level;
         break;
     }
+
+    // Diagnostic: log level-preemption events (higher-priority level interrupts lower-priority work).
+    if (previousLevel < m_dmaChannels.size() && m_activeDMAChannelLevel < m_dmaChannels.size() &&
+        m_activeDMAChannelLevel > previousLevel) {
+        const auto &from = m_dmaChannels[previousLevel];
+        const auto &to = m_dmaChannels[m_activeDMAChannelLevel];
+        std::fprintf(stderr,
+                     "[busarb] scuctx path=DMA-SCHED event=preempt from_level=%u to_level=%u "
+                     "from_rem=%06X to_rem=%06X from_src=%08X from_dst=%08X to_src=%08X to_dst=%08X\n",
+                     static_cast<unsigned int>(previousLevel), static_cast<unsigned int>(m_activeDMAChannelLevel),
+                     static_cast<unsigned int>(from.currXferCount), static_cast<unsigned int>(to.currXferCount),
+                     static_cast<unsigned int>(from.currSrcAddr), static_cast<unsigned int>(from.currDstAddr),
+                     static_cast<unsigned int>(to.currSrcAddr), static_cast<unsigned int>(to.currDstAddr));
+    }
+
 }
 
 FORCE_INLINE void SCU::TriggerImmediateDMA(uint32 index) {
@@ -1242,7 +1499,18 @@ FORCE_INLINE void SCU::TriggerImmediateDMA(uint32 index) {
         devlog::trace<grp::dma>("SCU DMA{}: Transfer triggered immediately", index);
         ch.start = true;
         RecalcDMAChannel();
-        RunDMA(0);
+        if (!(m_enableBusContention && m_enableBusContentionForDMA)) {
+            RunDMA(0);
+        } else {
+            // Under contention, allow at most one bounded immediate DMA quantum per
+            // scheduler tick. This preserves startup responsiveness (BIOS/FMV kickoffs)
+            // without repeatedly pre-booking future bus time in the same tick.
+            const uint64 nowTick = m_scheduler.CurrentCount();
+            if (m_lastImmediateDMARunTick != nowTick) {
+                m_lastImmediateDMARunTick = nowTick;
+                RunDMA(0);
+            }
+        }
     }
 }
 

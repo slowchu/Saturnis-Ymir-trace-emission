@@ -34,12 +34,25 @@ int main(int argc, char **argv) {
                           cxxopts::value(progOpts.enableDebugTracing)->default_value("false"));
     options.add_options()("bus-contention", "Enable SH2/SCU bus contention modeling",
                           cxxopts::value(progOpts.enableBusContention)->default_value("false"));
+    options.add_options()("if-ma-contention", "Enable SH-2 IF/MA contention approximation",
+                          cxxopts::value(progOpts.enableIFMAContention)->default_value("false"));
+    options.add_options()("bus-contention-stats",
+                          "With bus contention enabled, print aggregate arbiter stats every 1,000,000 calls",
+                          cxxopts::value(progOpts.busContentionStats)->default_value("false"));
     options.add_options()("bus-contention-sh2-only",
                           "With bus contention enabled, exclude SCU DMA from arbitration (diagnostic mode)",
                           cxxopts::value(progOpts.busContentionSH2Only)->default_value("false"));
     options.add_options()("bus-contention-scu-local-tick",
-                          "With bus contention enabled, advance SCU DMA arbiter now_tick within RunDMA (diagnostic mode)",
-                          cxxopts::value(progOpts.busContentionSCULocalTick)->default_value("false"));
+                          "With bus contention enabled, advance SCU DMA arbiter now_tick within RunDMA "
+                          "(enabled by default; disable for diagnostics)",
+                          cxxopts::value(progOpts.busContentionSCULocalTick)->default_value("true"));
+    options.add_options()("bus-contention-no-scsp",
+                          "With bus contention enabled, exclude SCSP (0x5A0'0000-0x5BF'FFFF) from B-bus arbitration "
+                          "(diagnostic mode)",
+                          cxxopts::value(progOpts.busContentionNoSCSP)->default_value("false"));
+    options.add_options()("scu-dma-lenient",
+                          "Disable strict Sattechs SCU-DMA prohibitions (compatibility/debug mode)",
+                          cxxopts::value(progOpts.scuDMALenient)->default_value("false"));
     options.add_options()("E,exceptions", "Capture all unhandled exceptions",
                           cxxopts::value(enableAllExceptions)->default_value("false"));
     options.parse_positional({"disc"});

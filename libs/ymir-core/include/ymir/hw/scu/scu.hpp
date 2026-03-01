@@ -107,6 +107,14 @@ public:
         m_enableBusContentionLocalTick = enable;
     }
 
+    void EnableStrictDMARestrictions(bool enable) {
+        m_enableStrictDMARestrictions = enable;
+    }
+
+    void EnableBBusSCSPArbitration(bool enable) {
+        m_enableBBusSCSPArbitration = enable;
+    }
+
     // Checks if a DMA transfer is active.
     // This is used to stall the SH-2s.
     bool IsDMAActive() const {
@@ -183,6 +191,8 @@ private:
     bool m_enableBusContention = false;
     bool m_enableBusContentionForDMA = true;
     bool m_enableBusContentionLocalTick = false;
+    bool m_enableBBusSCSPArbitration = true;
+    bool m_enableStrictDMARestrictions = true;
 
     CBExternalInterrupt m_cbExternalMasterInterrupt;
     CBExternalInterrupt m_cbExternalSlaveInterrupt;
@@ -225,8 +235,12 @@ private:
 
     std::array<DMAChannel, 3> m_dmaChannels;
     uint8 m_activeDMAChannelLevel;
-
-    void DMAReadIndirectTransfer(uint8 level);
+    // Optional persistent SCU-local arbiter timebase used by diagnostic
+    // --bus-contention-scu-local-tick mode.
+    uint64 m_dmaArbiterNowTick = 0;
+    // Guard for immediate-trigger DMA kick so we only run one bounded immediate
+    // DMA quantum per scheduler tick under contention.
+    uint64 m_lastImmediateDMARunTick = ~static_cast<uint64>(0);
 
     // Runs DMA transfers.
     // The cycle counter is used to trigger delayed interrupt signals.
