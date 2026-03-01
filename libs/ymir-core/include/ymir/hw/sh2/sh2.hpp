@@ -40,6 +40,7 @@
 #include <bitset>
 #include <iosfwd>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace busarb {
@@ -673,9 +674,39 @@ private:
 
     // Number of cycles executed in the current Advance invocation
     uint64 m_cyclesExecuted;
+    std::optional<uint64> m_instructionArbiterNowTick = std::nullopt;
+    uint64 m_multiplierFreeTick = 0;
+    // Persistent SH2-DMAC local arbiter timeline used to avoid re-entering
+    // long DMA streams behind already-booked bus time between scheduler slices.
+    uint64 m_dmacArbiterNowTick = 0;
+    // Cycle debt carried to subsequent scheduler slices when one DMA transfer unit
+    // exceeds the available per-slice DMAC budget.
+    uint64 m_dmacCycleBudgetDebt = 0;
 
     // Retrieves the current absolute cycle count
     uint64 GetCurrentCycleCount() const;
+    uint64 GetArbiterNowTick() const;
+    void BeginInstructionArbiterWindow();
+    void EndInstructionArbiterWindow();
+    void AdvanceArbiterNowTick(uint64 cycles);
+    enum class MMInstructionClass : uint8 {
+        MACW,
+        MACL,
+        MULW,
+        MULL,
+        DMULL,
+    };
+    enum class MMRegisterTransferClass : uint8 {
+        LDS_REG,
+        STS_REG,
+        LDS_MEM,
+        STS_MEM,
+    };
+    static constexpr uint64 MMTailCycles(MMInstructionClass cls);
+    static constexpr uint64 MMRegisterTransferMACycles(MMRegisterTransferClass cls);
+    uint64 ApplyMMStall(uint64 instructionCyclesSoFar) const;
+    uint64 ApplyMMRegisterTransferStall(MMRegisterTransferClass cls, uint64 instructionCyclesSoFar) const;
+    void ReserveMMTail(uint64 instructionCyclesSoFar, uint64 tailCycles);
 
     // -------------------------------------------------------------------------
     // Memory accessors
@@ -814,7 +845,8 @@ private:
     bool IsDMATransferActive(const DMAChannel &ch) const;
 
     template <bool debug, bool enableCache>
-    bool StepDMAC(uint32 channel);
+    bool StepDMAC(uint32 channel, uint64 &dmaArbiterNowTick, uint64 &consumedCycles, uint64 budgetRemaining,
+                  bool &yieldRequested);
 
     template <bool debug, bool enableCache>
     void AdvanceDMA(uint64 cycles);
@@ -957,8 +989,9 @@ private:
 
     FORCE_INLINE bool CheckBusWait(uint32 address, uint32 size, bool write);
     FORCE_INLINE bool ShouldUseArbiter(uint32 address, uint32 &busAddress) const;
-    FORCE_INLINE static bool IsArbiterManagedBusAddress(uint32 busAddress);
-    FORCE_INLINE uint64 ApplyArbiterWait(uint32 busAddress, uint32 size, bool write, uint64 baseCycles) const;
+    FORCE_INLINE bool IsArbiterManagedBusAddress(uint32 busAddress) const;
+    FORCE_INLINE uint64 ApplyArbiterWait(uint32 busAddress, uint32 size, bool write, uint64 baseCycles,
+                                         const char *pathLabel);
 
     void SetupDelaySlot(uint32 targetAddress);
 

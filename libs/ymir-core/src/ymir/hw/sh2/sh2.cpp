@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -277,6 +278,10 @@ void SH2::Reset(bool hard, bool watchdogInitiated) {
 
     m_delaySlotTarget = 0;
     m_delaySlot = false;
+    m_instructionArbiterNowTick.reset();
+    m_multiplierFreeTick = 0;
+    m_dmacArbiterNowTick = 0;
+    m_dmacCycleBudgetDebt = 0;
 
     m_cache.Reset();
 }
@@ -344,7 +349,10 @@ FLATTEN uint64 SH2::Advance(uint64 cycles, uint64 spilloverCycles) {
         // [[maybe_unused]] const uint32 prevPC = PC; // debug aid
 
         // TODO: choose between interpreter (cached or uncached) and JIT recompiler
-        m_cyclesExecuted += InterpretNext<debug, enableCache>();
+        BeginInstructionArbiterWindow();
+        const uint64 instructionCycles = InterpretNext<debug, enableCache>();
+        EndInstructionArbiterWindow();
+        m_cyclesExecuted += instructionCycles;
 
         // If PC is not in any of these places, something went horribly wrong
 
@@ -394,7 +402,9 @@ FLATTEN uint64 SH2::Step() {
     m_cyclesExecuted = 0; // so that AdvanceWDT/FRT sync to the scheduler time
     AdvanceWDT<false>();
     AdvanceFRT<false>();
+    BeginInstructionArbiterWindow();
     m_cyclesExecuted = InterpretNext<debug, enableCache>();
+    EndInstructionArbiterWindow();
     AdvanceDMA<debug, enableCache>(m_cyclesExecuted);
     return m_cyclesExecuted;
 }
@@ -490,6 +500,10 @@ void SH2::LoadState(const state::SH2State &state) {
     m_cache.LoadState(state.cache);
     SBYCR.u8 = state.SBYCR;
     m_sleep = state.sleep;
+    m_instructionArbiterNowTick.reset();
+    m_multiplierFreeTick = 0;
+    m_dmacArbiterNowTick = GetCurrentCycleCount();
+    m_dmacCycleBudgetDebt = 0;
 
     m_intrPending = !m_delaySlot && INTC.pending.level > SR.ILevel;
 }
@@ -846,22 +860,33 @@ FORCE_INLINE uint64 SH2::AccessCycles(uint32 address) {
     uint32 busAddress = 0;
     uint32 sizeBytes = sizeof(uint32);
     bool useArbiter = false;
+    bool externalMemoryAccess = false;
 
     switch (partition) {
     case 0b000: // cache
         if constexpr (enableCache && !write) {
-            // Check for cache hit
-            CacheEntry &entry = m_cache.GetEntry(address);
-            uint32 way = entry.FindWay(address);
+            if (m_cache.CCR.CE) {
+                // Check for cache hit
+                CacheEntry &entry = m_cache.GetEntry(address);
+                uint32 way = entry.FindWay(address);
 
-            if (IsValidCacheWay(way)) {
-                return 1;
-            } else {
-                // Cache miss - fill cache line
-                baseCycles = m_bus.GetAccessCycles<write>(address) * 4;
-                sizeBytes = 16;
-                useArbiter = ShouldUseArbiter(address, busAddress);
-                break;
+                if (IsValidCacheWay(way)) {
+                    if (m_systemFeatures.enableBusContentionStats && m_busArbiter != nullptr) {
+                        const uint32 cacheBusAddress = address & 0x7FF'FFFFu;
+                        if (IsArbiterManagedBusAddress(cacheBusAddress)) {
+                            const auto master = m_isMaster ? busarb::BusMasterId::SH2_A : busarb::BusMasterId::SH2_B;
+                            m_busArbiter->record_cache_hit_bypass(master, cacheBusAddress);
+                        }
+                    }
+                    return 1;
+                } else {
+                    // Cache miss - fill cache line
+                    baseCycles = m_bus.GetAccessCycles<write>(address) * 4;
+                    sizeBytes = 16;
+                    useArbiter = ShouldUseArbiter(address, busAddress);
+                    externalMemoryAccess = true;
+                    break;
+                }
             }
         } else if constexpr (!enableCache) {
             // Simplified model - assume cache hits on all accesses to cached area
@@ -872,6 +897,7 @@ FORCE_INLINE uint64 SH2::AccessCycles(uint32 address) {
     case 0b101: // cache-through
         baseCycles = m_bus.GetAccessCycles<write>(address);
         useArbiter = ShouldUseArbiter(address, busAddress);
+        externalMemoryAccess = true;
         break;
     case 0b010: return 1;        // associative purge
     case 0b011: return 1;        // cache address array
@@ -880,14 +906,79 @@ FORCE_INLINE uint64 SH2::AccessCycles(uint32 address) {
     case 0b111: return 4;        // I/O area
     }
 
-    if (!useArbiter) {
-        return baseCycles;
+    uint64 totalCycles = baseCycles;
+    if (useArbiter) {
+        totalCycles = ApplyArbiterWait(busAddress, sizeBytes, write, baseCycles, "MA");
     }
 
-    return ApplyArbiterWait(busAddress, sizeBytes, write, baseCycles);
+    // SH7604, section 7.4:
+    // When IF and MA contend in the same slot, the slot splits and MA executes first.
+    // The slot length becomes MA cycles + IF cycles.
+    if (m_systemFeatures.enableIFMAContention && externalMemoryAccess) {
+        // If MA wasn't arbitrated, still move local arbiter time forward so IF arbitration (if any)
+        // is issued after MA, respecting MA priority in the split slot.
+        if (!useArbiter) {
+            AdvanceArbiterNowTick(baseCycles);
+        }
+
+        const uint32 fetchAddress = (PC + 2u) & ~1u;
+        const uint32 fetchPartition = (fetchAddress >> 29u) & 0b111u;
+
+        bool ifBusCycle = false;
+        uint64 ifBaseCycles = 1;
+        uint32 ifSizeBytes = sizeof(uint16);
+        bool ifUseArbiter = false;
+        uint32 ifBusAddress = 0;
+
+        switch (fetchPartition) {
+        case 0b000: {
+            if constexpr (enableCache) {
+                if (m_cache.CCR.CE) {
+                    // Cached-area IF: cache hit -> no external bus cycle ("if"), miss -> line fill bus cycle ("IF")
+                    CacheEntry &entry = m_cache.GetEntry(fetchAddress);
+                    const uint32 way = entry.FindWay(fetchAddress);
+                    if (!IsValidCacheWay(way)) {
+                        ifBusCycle = true;
+                        ifBaseCycles = m_bus.GetAccessCycles<false>(fetchAddress) * 4;
+                        ifSizeBytes = 16;
+                    }
+                } else {
+                    ifBusCycle = true;
+                    ifBaseCycles = m_bus.GetAccessCycles<false>(fetchAddress);
+                }
+            } else {
+                ifBusCycle = true;
+                ifBaseCycles = m_bus.GetAccessCycles<false>(fetchAddress);
+            }
+            break;
+        }
+        case 0b001: [[fallthrough]];
+        case 0b101:
+            ifBusCycle = true;
+            ifBaseCycles = m_bus.GetAccessCycles<false>(fetchAddress);
+            break;
+        default:
+            // I/O / cache array fetches don't issue external bus cycles.
+            ifBusCycle = false;
+            break;
+        }
+
+        if (ifBusCycle) {
+            ifUseArbiter = ShouldUseArbiter(fetchAddress, ifBusAddress);
+            if (ifUseArbiter) {
+                const uint64 ifCycles = ApplyArbiterWait(ifBusAddress, ifSizeBytes, false, ifBaseCycles, "IF");
+                totalCycles += ifCycles;
+            } else {
+                totalCycles += ifBaseCycles;
+                AdvanceArbiterNowTick(ifBaseCycles);
+            }
+        }
+    }
+
+    return totalCycles;
 }
 
-FORCE_INLINE bool SH2::IsArbiterManagedBusAddress(uint32 busAddress) {
+FORCE_INLINE bool SH2::IsArbiterManagedBusAddress(uint32 busAddress) const {
     // BIOS ROM
     if (busAddress <= 0x00F'FFFF) {
         return true;
@@ -900,6 +991,14 @@ FORCE_INLINE bool SH2::IsArbiterManagedBusAddress(uint32 busAddress) {
 
     // A-Bus CS0/CS1
     if (busAddress >= 0x200'0000 && busAddress <= 0x4FF'FFFF) {
+        return true;
+    }
+
+    // B-Bus (SCSP, VDP1, VDP2)
+    if (busAddress >= 0x5A0'0000 && busAddress <= 0x5FB'FFFF) {
+        if (!m_systemFeatures.enableBBusSCSPArbitration && busAddress <= 0x5BF'FFFF) {
+            return false;
+        }
         return true;
     }
 
@@ -925,7 +1024,8 @@ FORCE_INLINE bool SH2::ShouldUseArbiter(uint32 address, uint32 &busAddress) cons
     return IsArbiterManagedBusAddress(busAddress);
 }
 
-FORCE_INLINE uint64 SH2::ApplyArbiterWait(uint32 busAddress, uint32 size, bool write, uint64 baseCycles) const {
+FORCE_INLINE uint64 SH2::ApplyArbiterWait(uint32 busAddress, uint32 size, bool write, uint64 baseCycles,
+                                          const char *pathLabel) {
     if (m_busArbiter == nullptr) {
         return baseCycles;
     }
@@ -935,12 +1035,34 @@ FORCE_INLINE uint64 SH2::ApplyArbiterWait(uint32 busAddress, uint32 size, bool w
     req.addr = busAddress;
     req.is_write = write;
     req.size_bytes = static_cast<uint8>(std::min<uint32>(size, 0xFFu));
-    req.now_tick = GetCurrentCycleCount();
+    req.now_tick = GetArbiterNowTick();
+    static constexpr uint64 kArbiterRebaseThresholdCycles = 50'000ULL;
+    m_busArbiter->rebase_if_far_ahead(req.addr, req.now_tick, kArbiterRebaseThresholdCycles);
 
+    const uint64 domainFreeTickBefore = m_busArbiter->bus_free_tick(req.addr);
     const busarb::BusWaitResult wait = m_busArbiter->query_wait(req);
+    static constexpr uint32 kContextWaitLogThresholdCycles = 20000U;
+    if (wait.should_wait && wait.wait_cycles >= kContextWaitLogThresholdCycles) {
+        std::fprintf(stderr,
+                     "[busarb] sh2ctx master=%s path=%s pc=%08X bus=%08X size=%u write=%u now=%llu free=%llu wait=%u "
+                     "base=%llu\n",
+                     m_isMaster ? "SH2-A" : "SH2-B", pathLabel, static_cast<unsigned int>(PC),
+                     static_cast<unsigned int>(busAddress), static_cast<unsigned int>(size), write ? 1U : 0U,
+                     static_cast<unsigned long long>(req.now_tick), static_cast<unsigned long long>(domainFreeTickBefore),
+                     wait.wait_cycles,
+                     static_cast<unsigned long long>(baseCycles));
+    }
     const uint64 tickStart = req.now_tick + wait.wait_cycles;
     m_busArbiter->commit_grant(req, tickStart);
-    return baseCycles + wait.wait_cycles;
+    // Charge full elapsed arbiter time (wait + granted service), not only base+wait.
+    // This keeps SH2 MA/IF timing consistent with SH2-DMAC and SCU DMA arbiter paths.
+    const uint64 freeTick = m_busArbiter->bus_free_tick(req.addr);
+    uint64 totalCycles = baseCycles + wait.wait_cycles;
+    if (freeTick > req.now_tick) {
+        totalCycles = freeTick - req.now_tick;
+    }
+    AdvanceArbiterNowTick(totalCycles);
+    return totalCycles;
 }
 
 // -----------------------------------------------------------------------------
@@ -1621,6 +1743,93 @@ FORCE_INLINE uint64 SH2::GetCurrentCycleCount() const {
     return m_scheduler.CurrentCount() + m_cyclesExecuted;
 }
 
+FORCE_INLINE uint64 SH2::GetArbiterNowTick() const {
+    const uint64 schedulerTick = GetCurrentCycleCount();
+    if (!m_instructionArbiterNowTick.has_value()) {
+        return schedulerTick;
+    }
+    return std::max(schedulerTick, *m_instructionArbiterNowTick);
+}
+
+FORCE_INLINE void SH2::BeginInstructionArbiterWindow() {
+    m_instructionArbiterNowTick = GetCurrentCycleCount();
+}
+
+FORCE_INLINE void SH2::EndInstructionArbiterWindow() {
+    m_instructionArbiterNowTick.reset();
+}
+
+FORCE_INLINE void SH2::AdvanceArbiterNowTick(uint64 cycles) {
+    if (m_instructionArbiterNowTick.has_value()) {
+        *m_instructionArbiterNowTick += cycles;
+    }
+}
+
+constexpr uint64 SH2::MMTailCycles(MMInstructionClass cls) {
+    // SH-2 multiplier tail occupancy from pipeline docs (h12p0):
+    // - MAC.W: Figure 7.23, mm runs for 2 cycles after final MA.
+    // - MAC.L: Figure 7.34, mm runs for 4 cycles after final MA.
+    // - MULS.W/MULU.W: Figure 7.53, mm runs for 2 cycles after MA.
+    // - DMULS.L/DMULU.L/MUL.L: Figure 7.63 class, mm runs for 4 cycles after MA.
+    using enum MMInstructionClass;
+    switch (cls) {
+    case MACW: return 2;
+    case MACL: return 4;
+    case MULW: return 2;
+    case MULL: return 4;
+    case DMULL: return 4;
+    }
+    return 0;
+}
+
+constexpr uint64 SH2::MMRegisterTransferMACycles(MMRegisterTransferClass cls) {
+    // SH-2 multiplier-register transfers (h12p0):
+    // STS/LDS MACH/MACL classes add an MA stage for multiplier access (including .L forms),
+    // and that MA participates in MA/IF contention.
+    using enum MMRegisterTransferClass;
+    switch (cls) {
+    case LDS_REG: return 1;
+    case STS_REG: return 1;
+    case LDS_MEM: return 1;
+    case STS_MEM: return 1;
+    }
+    return 0;
+}
+
+FORCE_INLINE uint64 SH2::ApplyMMStall(uint64 instructionCyclesSoFar) const {
+    if (!m_systemFeatures.enableIFMAContention) {
+        return 0;
+    }
+
+    const uint64 nowTick = GetCurrentCycleCount() + instructionCyclesSoFar;
+    if (nowTick >= m_multiplierFreeTick) {
+        return 0;
+    }
+
+    return m_multiplierFreeTick - nowTick;
+}
+
+FORCE_INLINE uint64 SH2::ApplyMMRegisterTransferStall(MMRegisterTransferClass cls, uint64 instructionCyclesSoFar) const {
+    if (!m_systemFeatures.enableIFMAContention) {
+        return 0;
+    }
+
+    const uint64 mmBusyStall = ApplyMMStall(instructionCyclesSoFar);
+    const uint64 maCycles = MMRegisterTransferMACycles(cls);
+    return mmBusyStall + maCycles;
+}
+
+FORCE_INLINE void SH2::ReserveMMTail(uint64 instructionCyclesSoFar, uint64 tailCycles) {
+    if (!m_systemFeatures.enableIFMAContention || tailCycles == 0) {
+        return;
+    }
+
+    const uint64 freeTick = GetCurrentCycleCount() + instructionCyclesSoFar + tailCycles;
+    if (freeTick > m_multiplierFreeTick) {
+        m_multiplierFreeTick = freeTick;
+    }
+}
+
 #if defined(YMIR_BUS_TRACE) && (YMIR_BUS_TRACE + 0)
 void SH2::BeginPendingBusAccess(uint32 address, uint32 size, bool write, uint64 tickNow) {
     if (m_busTracePendingAccess.active) {
@@ -1726,7 +1935,10 @@ FLATTEN FORCE_INLINE bool SH2::IsDMATransferActive(const DMAChannel &ch) const {
 }
 
 template <bool debug, bool enableCache>
-bool SH2::StepDMAC(uint32 channel) {
+bool SH2::StepDMAC(uint32 channel, uint64 &dmaArbiterNowTick, uint64 &consumedCycles, uint64 budgetRemaining,
+                   bool &yieldRequested) {
+    consumedCycles = 0;
+    yieldRequested = false;
     auto &ch = m_dmaChannels[channel];
 
     // TODO: prioritize channels based on DMAOR.PR
@@ -1760,43 +1972,60 @@ bool SH2::StepDMAC(uint32 channel) {
         }
     };
 
-    auto checkArbiterStall = [&](uint32 address, uint32 size, bool write) {
+    auto applyAccessTiming = [&](uint32 address, uint32 size, bool write) {
         uint32 busAddress = 0;
-        if (!ShouldUseArbiter(address, busAddress)) {
-            return false;
-        }
+        if (ShouldUseArbiter(address, busAddress)) {
+            const uint64 priorNowTick = dmaArbiterNowTick;
+            busarb::BusRequest req{};
+            req.master_id = m_isMaster ? busarb::BusMasterId::SH2_A : busarb::BusMasterId::SH2_B;
+            req.addr = busAddress;
+            req.is_write = write;
+            req.size_bytes = static_cast<uint8>(std::min<uint32>(size, 0xFFu));
+            req.now_tick = dmaArbiterNowTick;
+            static constexpr uint64 kArbiterRebaseThresholdCycles = 50'000ULL;
+            m_busArbiter->rebase_if_far_ahead(req.addr, req.now_tick, kArbiterRebaseThresholdCycles);
 
-        busarb::BusRequest req{};
-        req.master_id = m_isMaster ? busarb::BusMasterId::SH2_A : busarb::BusMasterId::SH2_B;
-        req.addr = busAddress;
-        req.is_write = write;
-        req.size_bytes = static_cast<uint8>(std::min<uint32>(size, 0xFFu));
-        req.now_tick = GetCurrentCycleCount();
+            const uint64 domainFreeTickBefore = m_busArbiter->bus_free_tick(req.addr);
+            const busarb::BusWaitResult wait = m_busArbiter->query_wait(req);
+            static constexpr uint32 kContextWaitLogThresholdCycles = 20000U;
+            if (wait.should_wait && wait.wait_cycles >= kContextWaitLogThresholdCycles) {
+                std::fprintf(stderr,
+                             "[busarb] sh2ctx master=%s path=DMAC ch=%u phase=initial pc=%08X bus=%08X size=%u "
+                             "write=%u now=%llu free=%llu wait=%u src=%08X dst=%08X\n",
+                             m_isMaster ? "SH2-A" : "SH2-B", static_cast<unsigned int>(channel),
+                             static_cast<unsigned int>(PC), static_cast<unsigned int>(busAddress),
+                             static_cast<unsigned int>(size), write ? 1U : 0U,
+                             static_cast<unsigned long long>(req.now_tick),
+                             static_cast<unsigned long long>(domainFreeTickBefore), wait.wait_cycles,
+                             static_cast<unsigned int>(ch.srcAddress), static_cast<unsigned int>(ch.dstAddress));
+            }
 
-        const busarb::BusWaitResult wait = m_busArbiter->query_wait(req);
-        if (wait.should_wait) {
+            const uint64 tickStart = req.now_tick + wait.wait_cycles;
+            m_busArbiter->commit_grant(req, tickStart);
+            dmaArbiterNowTick = m_busArbiter->bus_free_tick(req.addr);
+            if (dmaArbiterNowTick > priorNowTick) {
+                const uint64 delta = dmaArbiterNowTick - priorNowTick;
+                consumedCycles += delta;
+            }
             return true;
         }
 
-        m_busArbiter->commit_grant(req, req.now_tick);
-        return false;
+        if (CheckBusWait(address, size, write)) {
+            devlog::trace<grp::dma_xfer>(m_logPrefix, "DMAC{} transfer {} {:08X} stalled by bus wait signal", channel,
+                                         write ? "to" : "from", address);
+            return false;
+        }
+        if (m_systemFeatures.enableBusContention) {
+            const uint64 delta = write ? m_bus.GetAccessCycles<true>(address) : m_bus.GetAccessCycles<false>(address);
+            consumedCycles += delta;
+        }
+        return true;
     };
 
-    if (checkArbiterStall(ch.srcAddress, xferSize, false)) {
+    if (!applyAccessTiming(ch.srcAddress, xferSize, false)) {
         return false;
     }
-    if (checkArbiterStall(ch.dstAddress, xferSize, true)) {
-        return false;
-    }
-
-    if (CheckBusWait(ch.srcAddress, xferSize, false)) {
-        devlog::trace<grp::dma_xfer>(m_logPrefix, "DMAC{} transfer from {:08X} stalled by bus wait signal", channel,
-                                     ch.srcAddress);
-        return false;
-    }
-    if (CheckBusWait(ch.dstAddress, xferSize, true)) {
-        devlog::trace<grp::dma_xfer>(m_logPrefix, "DMAC{} transfer to {:08X} stalled by bus wait signal", channel,
-                                     ch.dstAddress);
+    if (!applyAccessTiming(ch.dstAddress, xferSize, true)) {
         return false;
     }
 
@@ -1885,16 +2114,77 @@ bool SH2::StepDMAC(uint32 channel) {
 
 template <bool debug, bool enableCache>
 FORCE_INLINE void SH2::AdvanceDMA(uint64 cycles) {
-    for (uint32 i = 0; i < 2; ++i) {
-        // HACK: run full transfers to fix sprite glitches in Golden Axe - The Duel
-        while (StepDMAC<debug, enableCache>(i)) {
+    const uint64 schedulerNowTick = GetCurrentCycleCount();
+    uint64 dmaArbiterNowTick = schedulerNowTick;
+    if (m_systemFeatures.enableBusContention) {
+        dmaArbiterNowTick = std::max(dmaArbiterNowTick, m_dmacArbiterNowTick);
+    }
+    const bool useCycleBudget = m_systemFeatures.enableBusContention;
+    // Let SH2-DMAC make forward progress under contention, but keep each call
+    // tightly bounded so large elapsed-cycle chunks do not pre-book bus time.
+    static constexpr uint64 kMaxDMACycleBudgetPerCall = 512;
+    const uint64 requestedBudget = useCycleBudget ? std::max<uint64>(cycles, 1u) : 0u;
+    uint64 cycleBudget = std::min<uint64>(requestedBudget, kMaxDMACycleBudgetPerCall);
+    uint64 elapsedCycles = 0;
+    auto persistDMACLocalTick = [&] {
+        if (!m_systemFeatures.enableBusContention) {
+            return;
         }
-        /*for (uint64 c = 0; c < cycles; ++c) {
-            if (!StepDMAC<debug, enableCache>(i)) {
+        const bool anyActive = IsDMATransferActive(m_dmaChannels[0]) || IsDMATransferActive(m_dmaChannels[1]);
+        m_dmacArbiterNowTick = anyActive ? dmaArbiterNowTick : GetCurrentCycleCount();
+    };
+    auto accountBudgetDebt = [&] {
+        if (!useCycleBudget) {
+            return;
+        }
+        if (elapsedCycles > cycleBudget) {
+            m_dmacCycleBudgetDebt += (elapsedCycles - cycleBudget);
+        }
+    };
+
+    if (useCycleBudget && m_dmacCycleBudgetDebt > 0) {
+        const uint64 debtApplied = std::min<uint64>(m_dmacCycleBudgetDebt, cycleBudget);
+        m_dmacCycleBudgetDebt -= debtApplied;
+        cycleBudget -= debtApplied;
+        if (cycleBudget == 0) {
+            persistDMACLocalTick();
+            return;
+        }
+    }
+
+    for (uint32 i = 0; i < 2; ++i) {
+        if (useCycleBudget && elapsedCycles >= cycleBudget) {
+            accountBudgetDebt();
+            persistDMACLocalTick();
+            return;
+        }
+
+        while (true) {
+            uint64 stepCycles = 0;
+            const uint64 budgetRemaining = useCycleBudget && cycleBudget > elapsedCycles ? (cycleBudget - elapsedCycles) : 0;
+            bool yieldRequested = false;
+            const bool hasMore =
+                StepDMAC<debug, enableCache>(i, dmaArbiterNowTick, stepCycles, budgetRemaining, yieldRequested);
+            elapsedCycles += stepCycles;
+            if (yieldRequested) {
+                accountBudgetDebt();
+                persistDMACLocalTick();
+                return;
+            }
+
+            if (useCycleBudget && elapsedCycles >= cycleBudget) {
+                accountBudgetDebt();
+                persistDMACLocalTick();
+                return;
+            }
+            if (!hasMore) {
                 break;
             }
-        }*/
+        }
     }
+
+    accountBudgetDebt();
+    persistDMACLocalTick();
 }
 
 template <bool write>
@@ -3062,17 +3352,19 @@ FORCE_INLINE uint64 SH2::LDCVBR(const DecodedArgs &args) {
 // lds Rm, MACH
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::LDSMACH(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::LDS_REG, 0);
     MAC.H = R[args.rm];
     AdvancePC<delaySlot>();
-    return 1;
+    return 1 + stallCycles;
 }
 
 // lds Rm, MACL
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::LDSMACL(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::LDS_REG, 0);
     MAC.L = R[args.rm];
     AdvancePC<delaySlot>();
-    return 1;
+    return 1 + stallCycles;
 }
 
 // lds Rm, PR
@@ -3110,17 +3402,19 @@ FORCE_INLINE uint64 SH2::STCVBR(const DecodedArgs &args) {
 // sts MACH, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::STSMACH(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::STS_REG, 0);
     R[args.rn] = MAC.H;
     AdvancePC<delaySlot>();
-    return 1;
+    return 1 + stallCycles;
 }
 
 // sts MACL, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::STSMACL(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::STS_REG, 0);
     R[args.rn] = MAC.L;
     AdvancePC<delaySlot>();
-    return 1;
+    return 1 + stallCycles;
 }
 
 // sts PR, Rn
@@ -3168,8 +3462,9 @@ FORCE_INLINE uint64 SH2::LDCMVBR(const DecodedArgs &args) {
 // lds.l @Rm+, MACH
 template <bool debug, bool enableCache, bool delaySlot>
 FORCE_INLINE uint64 SH2::LDSMMACH(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::LDS_MEM, 0);
     const uint32 address = R[args.rm];
-    const uint64 cycles = AccessCycles<false, enableCache>(address);
+    const uint64 cycles = stallCycles + AccessCycles<false, enableCache>(address);
     MAC.H = MemReadLong<enableCache>(address);
     R[args.rm] += 4;
     AdvancePC<delaySlot>();
@@ -3179,8 +3474,9 @@ FORCE_INLINE uint64 SH2::LDSMMACH(const DecodedArgs &args) {
 // lds.l @Rm+, MACL
 template <bool debug, bool enableCache, bool delaySlot>
 FORCE_INLINE uint64 SH2::LDSMMACL(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::LDS_MEM, 0);
     const uint32 address = R[args.rm];
-    const uint64 cycles = AccessCycles<false, enableCache>(address);
+    const uint64 cycles = stallCycles + AccessCycles<false, enableCache>(address);
     MAC.L = MemReadLong<enableCache>(address);
     R[args.rm] += 4;
     AdvancePC<delaySlot>();
@@ -3234,9 +3530,10 @@ FORCE_INLINE uint64 SH2::STCMVBR(const DecodedArgs &args) {
 // sts.l MACH, @-Rn
 template <bool debug, bool enableCache, bool delaySlot>
 FORCE_INLINE uint64 SH2::STSMMACH(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::STS_MEM, 0);
     R[args.rn] -= 4;
     const uint32 address = R[args.rn];
-    const uint64 cycles = AccessCycles<true, enableCache>(address);
+    const uint64 cycles = stallCycles + AccessCycles<true, enableCache>(address);
     MemWriteLong<debug, enableCache>(address, MAC.H);
     AdvancePC<delaySlot>();
     return cycles;
@@ -3245,9 +3542,10 @@ FORCE_INLINE uint64 SH2::STSMMACH(const DecodedArgs &args) {
 // sts.l MACL, @-Rn
 template <bool debug, bool enableCache, bool delaySlot>
 FORCE_INLINE uint64 SH2::STSMMACL(const DecodedArgs &args) {
+    const uint64 stallCycles = ApplyMMRegisterTransferStall(MMRegisterTransferClass::STS_MEM, 0);
     R[args.rn] -= 4;
     const uint32 address = R[args.rn];
-    const uint64 cycles = AccessCycles<true, enableCache>(address);
+    const uint64 cycles = stallCycles + AccessCycles<true, enableCache>(address);
     MemWriteLong<debug, enableCache>(address, MAC.L);
     AdvancePC<delaySlot>();
     return cycles;
@@ -3603,6 +3901,7 @@ FORCE_INLINE uint64 SH2::MACW(const DecodedArgs &args) {
     cycles += AccessCycles<false, enableCache>(address1);
     const sint32 op1 = static_cast<sint16>(MemReadWord<enableCache>(address1));
     R[args.rm] += 2;
+    cycles += ApplyMMStall(cycles);
 
     const sint32 mul = op1 * op2;
     if (SR.S) {
@@ -3619,6 +3918,7 @@ FORCE_INLINE uint64 SH2::MACW(const DecodedArgs &args) {
     }
 
     AdvancePC<delaySlot>();
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::MACW));
     return cycles;
 }
 
@@ -3633,6 +3933,7 @@ FORCE_INLINE uint64 SH2::MACL(const DecodedArgs &args) {
     cycles += AccessCycles<false, enableCache>(address1);
     const sint64 op1 = static_cast<sint64>(static_cast<sint32>(MemReadLong<enableCache>(address1)));
     R[args.rm] += 4;
+    cycles += ApplyMMStall(cycles);
 
     const sint64 mul = op1 * op2;
     sint64 result = mul + MAC.u64;
@@ -3646,49 +3947,65 @@ FORCE_INLINE uint64 SH2::MACL(const DecodedArgs &args) {
     MAC.u64 = result;
 
     AdvancePC<delaySlot>();
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::MACL));
     return cycles;
 }
 
 // mul.l Rm, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::MULL(const DecodedArgs &args) {
+    uint64 cycles = 2;
+    cycles += ApplyMMStall(0);
     MAC.L = R[args.rm] * R[args.rn];
     AdvancePC<delaySlot>();
-    return 2;
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::MULL));
+    return cycles;
 }
 
 // muls.w Rm, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::MULS(const DecodedArgs &args) {
+    uint64 cycles = 1;
+    cycles += ApplyMMStall(0);
     MAC.L = bit::sign_extend<16>(R[args.rm]) * bit::sign_extend<16>(R[args.rn]);
     AdvancePC<delaySlot>();
-    return 1;
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::MULW));
+    return cycles;
 }
 
 // mulu.w Rm, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::MULU(const DecodedArgs &args) {
+    uint64 cycles = 1;
+    cycles += ApplyMMStall(0);
     auto cast = [](uint32 val) { return static_cast<uint32>(static_cast<uint16>(val)); };
     MAC.L = cast(R[args.rm]) * cast(R[args.rn]);
     AdvancePC<delaySlot>();
-    return 1;
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::MULW));
+    return cycles;
 }
 
 // dmuls.l Rm, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::DMULS(const DecodedArgs &args) {
+    uint64 cycles = 2;
+    cycles += ApplyMMStall(0);
     auto cast = [](uint32 val) { return static_cast<sint64>(static_cast<sint32>(val)); };
     MAC.u64 = cast(R[args.rm]) * cast(R[args.rn]);
     AdvancePC<delaySlot>();
-    return 2;
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::DMULL));
+    return cycles;
 }
 
 // dmulu.l Rm, Rn
 template <bool delaySlot>
 FORCE_INLINE uint64 SH2::DMULU(const DecodedArgs &args) {
+    uint64 cycles = 2;
+    cycles += ApplyMMStall(0);
     MAC.u64 = static_cast<uint64>(R[args.rm]) * static_cast<uint64>(R[args.rn]);
     AdvancePC<delaySlot>();
-    return 2;
+    ReserveMMTail(cycles, MMTailCycles(MMInstructionClass::DMULL));
+    return cycles;
 }
 
 // div0s r{}, Rm, Rn
